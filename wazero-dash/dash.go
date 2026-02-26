@@ -28,10 +28,16 @@ type checkpoint struct {
 	cstack       []byte
 }
 
+// ExecHandler is called when dash tries to execute an external command.
+// It receives the command name and full argv (argv[0] == command name).
+// Returns the exit status (0-255). Return 127 if the command is not found.
+type ExecHandler func(ctx context.Context, argv []string) int
+
 // dashState holds the setjmp/longjmp checkpoint state shared between
 // host functions and the Dash wrapper.
 type dashState struct {
 	checkpoints []*checkpoint
+	execHandler ExecHandler
 }
 
 // Dash wraps a dash WASI reactor module providing a high-level API
@@ -70,7 +76,7 @@ func NewDash(ctx context.Context, r wazero.Runtime, config wazero.ModuleConfig) 
 		return nil, err
 	}
 
-	// Install host functions for setjmp/longjmp via snapshot/restore.
+	// Install host functions for setjmp/longjmp and command execution.
 	if _, err := r.NewHostModuleBuilder("env").
 		NewFunctionBuilder().
 		WithFunc(setjmpHost).
@@ -78,6 +84,9 @@ func NewDash(ctx context.Context, r wazero.Runtime, config wazero.ModuleConfig) 
 		NewFunctionBuilder().
 		WithFunc(longjmpHost).
 		Export("__longjmp").
+		NewFunctionBuilder().
+		WithFunc(execCommandHost).
+		Export("__exec_command").
 		Instantiate(ctx); err != nil {
 		return nil, err
 	}
@@ -351,6 +360,13 @@ func (d *Dash) SetVar(ctx context.Context, name, value string) error {
 	return nil
 }
 
+// SetExecHandler registers a callback for external command execution.
+// When dash encounters a command that is not a builtin or function,
+// it calls this handler with the argv array. Return 127 for unknown commands.
+func (d *Dash) SetExecHandler(h ExecHandler) {
+	d.state.execHandler = h
+}
+
 // readCString reads a null-terminated string from WASM memory.
 func (d *Dash) readCString(ptr uint32) string {
 	mem := d.mod.Memory()
@@ -434,4 +450,38 @@ func longjmpHost(ctx context.Context, mod api.Module, bufPtr uint32, val int32) 
 
 	// Restore execution state. Makes the setjmp host function return val.
 	cp.snapshot.Restore([]uint64{uint64(uint32(val))})
+}
+
+// execCommandHost is called when dash tries to execute an external command.
+//
+// C signature: int __wasi_host_exec(int argc, char **argv)
+// The host reads argc and the argv pointer array from WASM memory,
+// dispatches to the registered ExecHandler, and returns the exit status.
+func execCommandHost(ctx context.Context, mod api.Module, argc uint32, argvPtr uint32) int32 {
+	state := ctx.Value(dashStateKey{}).(*dashState)
+	if state.execHandler == nil {
+		return 127
+	}
+
+	argv := make([]string, argc)
+	for i := range argc {
+		ptr, _ := mod.Memory().ReadUint32Le(argvPtr + uint32(i)*4)
+		argv[i] = readCStringMod(mod, ptr)
+	}
+
+	return int32(state.execHandler(ctx, argv))
+}
+
+// readCStringMod reads a null-terminated string from WASM memory.
+func readCStringMod(mod api.Module, ptr uint32) string {
+	mem := mod.Memory()
+	var buf []byte
+	for i := uint32(0); ; i++ {
+		b, ok := mem.ReadByte(ptr + i)
+		if !ok || b == 0 {
+			break
+		}
+		buf = append(buf, b)
+	}
+	return string(buf)
 }
